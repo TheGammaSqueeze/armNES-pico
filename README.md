@@ -12,7 +12,8 @@ MT6785, `lk-mt6785`, branch `lk-gba-emu-sd-card-kpa`).
 
 All of the emulation is armNES's. This repository adds no emulation code: it holds the upstream
 tree as a submodule, the glue that lets armNES's libretro port run inside a bootloader with no
-operating system, a build script and a test harness. At armNES v1.1 no change to upstream is needed.
+operating system, a build script and a test harness. One patch to upstream, for speed, is applied at
+build time (see "Patches").
 
 **This is an experimental project and does not accept issues.** Please do not report problems you
 see with armNES-pico to armNES upstream either: this build runs armNES in a bootloader on hardware
@@ -47,6 +48,7 @@ with both submodules at the commits the blob was built from.
 | Path | What it is |
 | --- | --- |
 | `upstream/` | armNES, as a git submodule at v1.1 (`480a9bc`), never modified in place |
+| `patches/` | changes to upstream, applied by `build.sh` to a copy in `out/src` |
 | `zlib/` | zlib, as a git submodule at v1.3.1; only `crc32.c` is built |
 | `pico/pico_core.c` | the LK's core interface (`nes_core_abi.h`, version 1) filled in for armNES's libretro port |
 | `pico/pico_libc.c` | the heap over the LK's arena, the Disk System BIOS served to `fopen` from memory, newlib's system calls, the archive calls the port references |
@@ -54,6 +56,7 @@ with both submodules at the commits the blob was built from.
 | `pico/blob.ld` | link script: flat image at 0x4F800000, 20 byte header |
 | `build.sh` | builds `out/armnes-pico.blob` |
 | `tools/harness.c`, `tools/build_harness.sh` | runs the blob on a PC under qemu-arm, as the LK does |
+| `tools/nescompare.c` | runs armNES's core natively and prints what two builds must agree on (per frame picture and sound CRCs, state CRCs) |
 | `tools/make_test_images.py` | writes a tiny cartridge, disk and BIOS stand in, so the harness runs without games |
 | `tools/package.sh` | packs a release: the SD card zip and the source archive, into `dist/` |
 | `.github/workflows/build.yml` | CI: builds every push, runs the harness, publishes a release for a `v*` tag |
@@ -61,9 +64,14 @@ with both submodules at the commits the blob was built from.
 
 ### Patches
 
-None at armNES v1.1. `build.sh` still copies upstream to `out/src` and applies any
-`patches/*.patch` there, each meant to sit behind a define of its own so that without the define
-upstream's code is unchanged. What looked like it might need one did not:
+`build.sh` copies upstream to `out/src` and applies `patches/*.patch` there, each behind a define of
+its own that `build.sh` turns on (`DEFS`); without the define, upstream's code is unchanged.
+
+| Patch | Why |
+| --- | --- |
+| `0001-fds-batched-cycles.patch` | Built with `ARMNES_HOST_FDS_BATCH`, the Disk System's board no longer needs every CPU cycle stepped in full. Upstream gives it a `cpuCycle` hook (its IRQ timer, the drive and the wavetable sound), and any board with one turns off the CPU's quiet cycle fast path, so a Disk System frame cost about five times a cartridge's (3600 frames of Super Mario Bros. on disk took 4.4 s natively against 0.8 s for the cartridge). With the define the board's clock runs inside the APU's catch-up instead, one board cycle before each APU cycle, so its sound is exactly what each APU cycle mixes, and it can fall behind the CPU: three new board hooks run it n cycles at once (counting the timer, the drive's delay and a halted sound's modulator down in one go and stepping cycle by cycle only around an event or while the wave plays), say how many cycles it can run before its IRQ line can change (the timer's underflow, the drive's next byte, never while the drive is stopped), which caps how far the APU and the board may fall behind, and say whether its sound holds still. Reads and writes of its registers, the BIOS's disk header check and a disk change bring the APU and the board up to the CPU first. While the board's sound moves and the APU's own channels hold their levels, the APU's counters still move on at once and only the board and the mix go cycle by cycle. The RAM adapter's RAM ($6000-$DFFF), where the games run, and the BIOS page (hooked only for $E445) are read and written straight from their pages, as cartridge ROM is. Pictures, sound and the machine state stay bit-identical to upstream (24000 frames compared with `tools/nescompare.c`, see below); only the scheduling fields of a save state (`slowCycles`, `apuQuiet`, `quietBudget`) and the fast PPU's record of its address bus differ. The same game now runs 3600 frames in 0.83 s at the title screen and 1.04 s in play, as fast as the cartridge (0.83 s, 1.01 s). Without the define, upstream's code is unchanged. |
+
+What looked like it might need a patch did not:
 
 | Need | How it is met without a patch |
 | --- | --- |
@@ -147,6 +155,25 @@ Run on Super Mario Bros., Super Mario Bros. 3, The Legend of Zelda, Final Fantas
 Adventure, Castlevania III (MMC5) and a two sided disk with a stand in BIOS, 1200 frames each with
 Start pressed now and then: every check passes, 798.6 sound frames a frame, `fps_milli` 60099
 (50007 with the region set to PAL or Dendy).
+
+`tools/nescompare.sh <game> [frames]` checks a patch against upstream: it builds armNES's core
+natively twice, upstream as it is and `out/src` with the patches and their defines, runs both on the
+game and compares every frame's picture and sound and a state CRC every 600 frames. The `CMP_*`
+variables (`tools/nescompare.c`) set the BIOS, buttons, disk changes, register writes between frames
+(`CMP_POKE`), run ahead's save, look-ahead frame and load before every frame (`CMP_RUNAHEAD`) and
+where states are written.
+
+For `0001-fds-batched-cycles.patch`: Super Mario Bros. on disk, 24000 frames with buttons from the
+title into play and through game overs, each also with the disk taken out and put back, with run
+ahead before every frame, with the Disk System's wave, modulator and envelopes driven through
+`CMP_POKE` (the game leaves its sound alone), and with its timer IRQ armed: every frame's picture and
+sound is identical to upstream's. So are the states but for the scheduling fields named above and,
+with the PPU caught up before saving, at one checkpoint the fast PPU's address bus record (only
+boards that watch the PPU bus read it); with the timer IRQ armed, $2002 reads also stamp three
+open bus bits one dot apart (upstream's two ways of reading $2002 disagree by a dot there, which the
+game now reaches as cartridges always did). The cartridge Super Mario Bros. is identical in
+everything, states included. The harness passes every check with the disk and the stand in two
+sided disk, with the same picture hashes and sound as a blob built without the patch.
 
 ## Installing
 

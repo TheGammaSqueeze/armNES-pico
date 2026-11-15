@@ -58,7 +58,10 @@ SRC=$OUT/src
 # matters. TUNE, OPT and EXTRA_CFLAGS override for experiments.
 TUNE=${TUNE:-cortex-a55}
 ARCH="-march=armv8-a+simd -mtune=$TUNE -marm -mfpu=neon-fp-armv8 -mfloat-abi=softfp"
-BASE="$ARCH -std=gnu11 ${OPT:--O3} -flto -ffunction-sections -fdata-sections -fno-common ${EXTRA_CFLAGS:-}"
+# The defines that turn the patches on (README.md, "Patches"); every file is built with them, as
+# some change structures the glue shares
+DEFS="-DARMNES_HOST_FDS_BATCH"
+BASE="$ARCH -std=gnu11 ${OPT:--O3} -flto -ffunction-sections -fdata-sections -fno-common $DEFS ${EXTRA_CFLAGS:-}"
 # shared/libretro comes before libretro-common's include folder, so "libretro.h" is armNES's copy
 INC="-I$SRC/shared/libretro -I$SRC/src -I$SRC/src/boards -I$ROOT/zlib"
 # armNES's core, as its CMakeLists.txt builds it (-O3, functions aligned to 64 bytes)

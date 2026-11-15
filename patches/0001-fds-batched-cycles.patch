@@ -1,0 +1,463 @@
+--- a/src/nes.h
++++ b/src/nes.h
+@@ -222,6 +222,19 @@
+ 	// Reads of the PPU's pattern and name tables, for boards that change data as it's fetched
+ 	uint8_t (*ppuRead)(struct NES*, uint16_t address);
+ 	void (*cpuCycle)(struct NES*);
++#ifdef ARMNES_HOST_FDS_BATCH
++	// In place of cpuCycle, for a board whose clock may fall behind the CPU's: cpuRun runs it that
++	// many CPU cycles at once. The APU runs it, each cycle just before its own, so the board's sound is
++	// what each APU cycle mixes; the board brings the APU up to the CPU before its registers are read
++	// or written. irqQuietCycles: the CPU cycles it can run before its IRQ line can change;
++	// audioQuietCycles: before what audio returns can change.
++	void (*cpuRun)(struct NES*, int cycles);
++	int (*irqQuietCycles)(struct NES*);
++	int (*audioQuietCycles)(struct NES*);
++	// Pages of $4020-$FFFF where the board does nothing on a read or a write, even if readHooks has
++	// them, but for reads of watchAddress: the CPU reads and writes prgPages there directly
++	uint16_t plainPages, watchAddress;
++#endif
+ 	// M2 rising, partway through each CPU cycle
+ 	void (*m2Rise)(struct NES*);
+ 	// PPU dots during which the board's IRQ line can't change on its own
+--- a/src/cpu.c
++++ b/src/cpu.c
+@@ -388,6 +388,34 @@
+ 	endCycle(nes);
+ }
+ 
++#ifdef ARMNES_HOST_FDS_BATCH
++// Reads that need nothing but the page: program ROM at $8000-$FFFF, and the board's plain pages
++// (on the Disk System its RAM from $6000, where the games run, and its BIOS but for $E445)
++static inline __attribute__((always_inline)) bool pageRead(const struct NES* nes, uint16_t address, const uint8_t* page) {
++	uint16_t bit = 1 << (address >> 12);
++	if (!page || (nes->cheatPages & bit)) {
++		return false;
++	}
++	if (!(nes->readHooks & bit)) {
++		return address >= 0x8000 || (nes->board->plainPages & bit);
++	}
++	return (nes->board->plainPages & bit) && address != nes->board->watchAddress;
++}
++
++// A write to one of the board's plain pages: only the page takes it
++static inline __attribute__((always_inline)) bool pageWrite(struct NES* nes, uint16_t address, uint8_t value) {
++	int page = address >> 12;
++	if (address < 0x4020 || !(nes->board->plainPages & (1 << page))) {
++		return false;
++	}
++	if (nes->prgWritable[page] && nes->prgPages[page]) {
++		nes->prgPages[page][address & 0xFFF] = value;
++	}
++	nes->cpu.openBus = nes->cpu.internalBus = value;
++	return true;
++}
++#endif
++
+ static __attribute__((noinline)) uint8_t readFull(struct NES* nes, uint16_t address) {
+ 	struct Cpu* cpu = &nes->cpu;
+ 	quietEnd(nes);
+@@ -398,7 +426,11 @@
+ 	startCycle(nes);
+ 	uint8_t value;
+ 	uint8_t* page = nes->prgPages[address >> 12];
++#ifdef ARMNES_HOST_FDS_BATCH
++	if (pageRead(nes, address, page)) {
++#else
+ 	if (address >= 0x8000 && page && !((nes->readHooks | nes->cheatPages) & (1 << (address >> 12)))) {
++#endif
+ 		// Program ROM, the common case
+ 		value = page[address & 0xFFF];
+ 		cpu->openBus = cpu->internalBus = value;
+@@ -419,7 +451,11 @@
+ 		uint8_t value;
+ 		if (address < 0x2000) {
+ 			value = nes->ram[address & 0x7FF];
++#ifdef ARMNES_HOST_FDS_BATCH
++		} else if (pageRead(nes, address, page)) {
++#else
+ 		} else if (address >= 0x8000 && page && !((nes->readHooks | nes->cheatPages) & (1 << (address >> 12)))) {
++#endif
+ 			value = page[address & 0xFFF];
+ 		} else {
+ 			return readFull(nes, address);
+@@ -436,7 +472,13 @@
+ 	quietEnd(nes);
+ 	nes->cpu.addressBus = address;
+ 	startCycle(nes);
++#ifdef ARMNES_HOST_FDS_BATCH
++	if (!pageWrite(nes, address, value)) {
++		busWrite(nes, address, value);
++	}
++#else
+ 	busWrite(nes, address, value);
++#endif
+ 	endCycle(nes);
+ }
+ 
+@@ -448,6 +490,13 @@
+ 		nes->ram[address & 0x7FF] = value;
+ 		return;
+ 	}
++#ifdef ARMNES_HOST_FDS_BATCH
++	if (nes->quietBudget > 0 && pageWrite(nes, address, value)) {
++		nes->cpu.addressBus = address;
++		nes->quietBudget--;
++		return;
++	}
++#endif
+ 	writeFull(nes, address, value);
+ }
+ 
+--- a/src/apu.c
++++ b/src/apu.c
+@@ -527,6 +527,12 @@
+ void apuCycle(struct NES* nes) {
+ 	struct Apu* apu = &nes->apu;
+ 	struct Dmc* d = &apu->dmc;
++#ifdef ARMNES_HOST_FDS_BATCH
++	// The board's clock for this cycle, before the mix takes its sound
++	if (nes->board->cpuRun) {
++		nes->board->cpuRun(nes, 1);
++	}
++#endif
+ 	apu->cycles++;
+ 
+ 	if (!apu->strobing) {
+@@ -675,10 +681,18 @@
+ 		apu->mixDirty | (apu->strobing && !apu->strobed) | d->setImplicitAbort) {
+ 		return 0;
+ 	}
++#ifdef ARMNES_HOST_FDS_BATCH
++	// A board run with the APU goes along, its sound taken cycle by cycle while it moves (apuRun())
++	if (!(apu->frameReset & 0x80) || (nes->board->audio && !nes->board->cpuRun)) {
++		return 0;
++	}
++	int k = frameQuiet(nes);
++#else
+ 	if (!(apu->frameReset & 0x80) || nes->board->audio) {
+ 		return 0;
+ 	}
+ 	int k = frameQuiet(nes);
++#endif
+ 	int t;
+ 	for (int i = 0; i < 2; i++) {
+ 		if (!pulseSilent(&apu->pulse[i])) {
+@@ -756,11 +770,49 @@
+ 	apu->putCycle ^= k & 1;
+ }
+ 
++#ifdef ARMNES_HOST_FDS_BATCH
++// Cycles in which the APU's own channels keep their levels while the board's sound moves: the board
++// runs and the mix is taken each cycle as apuCycle() takes it, then the APU's counters move on at once
++static void boardMixCycles(struct NES* nes, int k) {
++	struct Apu* apu = &nes->apu;
++	uint64_t start = apu->cycles;
++	for (int i = 0; i < k; i++) {
++		nes->board->cpuRun(nes, 1);
++		apu->cycles++;
++		if (!apu->stereo) {
++			int32_t level = mix(nes);
++			if (level != apu->lastMix) {
++				apu->lastMix = level;
++				levelChange(nes, level, level);
++			}
++		} else {
++			int right;
++			int32_t level = mixStereo(nes, &right);
++			if (level != apu->lastMix || right != nes->mixer.lastRight) {
++				apu->lastMix = level;
++				nes->mixer.lastRight = right;
++				levelChange(nes, level, right);
++			}
++		}
++	}
++	apu->cycles = start;
++}
++#endif
++
+ void apuRun(struct NES* nes, int cycles) {
+ 	while (cycles > 0) {
+ 		int k = bulkCycles(nes);
+ 		if (k > 0) {
+ 			k = k < cycles ? k : cycles;
++#ifdef ARMNES_HOST_FDS_BATCH
++			if (nes->board->cpuRun) {
++				if (nes->board->audioQuietCycles(nes) >= k) {
++					nes->board->cpuRun(nes, k);
++				} else {
++					boardMixCycles(nes, k);
++				}
++			}
++#endif
+ 			bulkAdvance(nes, k);
+ 			cycles -= k;
+ 		} else {
+@@ -774,16 +826,30 @@
+ // delayed write landing
+ int apuQuietCycles(struct NES* nes) {
+ 	const struct Apu* apu = &nes->apu;
++#ifdef ARMNES_HOST_FDS_BATCH
++	// A board run with the APU: its sound is taken as each cycle runs, and the cycles stop short of
++	// its IRQ line changing
++	int board = 1 << 30;
++	if (nes->board->cpuRun) {
++		board = nes->board->irqQuietCycles(nes);
++	} else if (nes->board->audio) {
++		return 0;
++	}
++#else
+ 	// A board's own sound moves on every cycle: the mix has to be taken with it
+ 	if (nes->board->audio) {
+ 		return 0;
+ 	}
++#endif
+ 	const struct Dmc* d = &apu->dmc;
+ 	if (d->enableDelay | d->loadDelay | d->cannotRun | apu->clearingFrameFlag | apu->quarterClock |
+ 		apu->halfClock | d->setImplicitAbort | !(apu->frameReset & 0x80) | nes->cpu.dmcDma) {
+ 		return 0;
+ 	}
+ 	int k = frameQuiet(nes);
++#ifdef ARMNES_HOST_FDS_BATCH
++	k = board < k ? board : k;
++#endif
+ 	// The DMC's timer matters only at the tick that empties the shifter with sample bytes left, which
+ 	// asks for a DMA; the ticks before it change nothing but the sound
+ 	if (!d->bytesRemaining) {
+--- a/src/boards/fds.c
++++ b/src/boards/fds.c
+@@ -319,6 +319,38 @@
+ 	}
+ }
+ 
++#ifdef ARMNES_HOST_FDS_BATCH
++// The board's clock runs with the APU's and can be behind the CPU: brought up to it before the CPU
++// sees or changes the board, and how long it stays quiet worked out again after
++static void fdsCatchUp(struct NES* nes) {
++	nesApuSync(nes);
++}
++
++static void fdsRequiet(struct NES* nes) {
++	nes->apuQuiet = apuQuietCycles(nes);
++}
++
++static uint8_t fdsReadRegister(struct NES* nes, uint16_t address);
++
++static uint8_t fdsRead(struct NES* nes, uint16_t address) {
++	if (address >= 0xE000) {
++		if (address == 0xE445 && nes->cart.diskSides > 1) {
++			fdsCatchUp(nes);
++			autoInsert(nes);
++			fdsRequiet(nes);
++		}
++		return nes->cart.prg[address - 0xE000];
++	}
++	fdsCatchUp(nes);
++	uint8_t value = fdsReadRegister(nes, address);
++	fdsRequiet(nes);
++	return value;
++}
++
++static uint8_t fdsReadRegister(struct NES* nes, uint16_t address) {
++	struct Fds* f = FD;
++	uint8_t open = nes->cpu.openBus;
++#else
+ static uint8_t fdsRead(struct NES* nes, uint16_t address) {
+ 	struct Fds* f = FD;
+ 	uint8_t open = nes->cpu.openBus;
+@@ -328,6 +360,7 @@
+ 		}
+ 		return nes->cart.prg[address - 0xE000];
+ 	}
++#endif
+ 	if (f->diskEnabled) {
+ 		switch (address) {
+ 		case 0x4030: {
+@@ -357,7 +390,23 @@
+ 	return open;
+ }
+ 
++#ifdef ARMNES_HOST_FDS_BATCH
++static void fdsWriteRegister(struct NES* nes, uint16_t address, uint8_t value);
++
++// Writes to the RAM adapter's RAM come here too; only the registers need the board's clock
++static void fdsWrite(struct NES* nes, uint16_t address, uint8_t value) {
++	if (address >= 0x4100) {
++		return;
++	}
++	fdsCatchUp(nes);
++	fdsWriteRegister(nes, address, value);
++	fdsRequiet(nes);
++}
++
++static void fdsWriteRegister(struct NES* nes, uint16_t address, uint8_t value) {
++#else
+ static void fdsWrite(struct NES* nes, uint16_t address, uint8_t value) {
++#endif
+ 	struct Fds* f = FD;
+ 	if (address == 0x4023) {
+ 		f->diskEnabled = value & 1;
+@@ -430,6 +479,123 @@
+ 	fdsSoundCycle(&f->sound);
+ }
+ 
++#ifdef ARMNES_HOST_FDS_BATCH
++enum { FDS_FOREVER = 1 << 30 };
++
++// What driveCycle() does on the next cycle
++enum DriveStep { DRIVE_STOPPED, DRIVE_STOPPING, DRIVE_WAITING, DRIVE_HEAD_BACK, DRIVE_COUNTING };
++
++static enum DriveStep driveStep(struct NES* nes) {
++	struct Fds* f = FD;
++	if (!sideData(nes) || !(f->control & 0x01)) {
++		return f->endOfHead && !f->scanning ? DRIVE_STOPPED : DRIVE_STOPPING;
++	}
++	if ((f->control & 0x02) && !f->scanning) {
++		return DRIVE_WAITING;
++	}
++	return f->endOfHead ? DRIVE_HEAD_BACK : DRIVE_COUNTING;
++}
++
++// The sound's level on the next cycle while the wave is halted (its place in the wave and its volume
++// then stay put)
++static int32_t haltedLevel(const struct FdsSound* s) {
++	static const int32_t master[4] = { 1815, 1210, 908, 726 };
++	uint8_t output = s->waveWrite ? s->waveOutput : s->wave[s->wavePhase >> 16];
++	return (output * (s->volume < 32 ? s->volume : 32) * master[s->masterVolume]) >> 8;
++}
++
++// The sound holds still: the wave halted (so are the envelopes), its output latched and the filter
++// settled on its level. The modulator may still turn; it only matters to a running wave.
++static bool soundStill(const struct FdsSound* s) {
++	if (!s->waveHalt || (!s->waveWrite && s->waveOutput != s->wave[s->wavePhase >> 16])) {
++		return false;
++	}
++	return ((haltedLevel(s) - s->filtered) * 460) >> 16 == 0;
++}
++
++// Cycles ahead in which fdsCycle() would only count: the timer down to 0, the drive's delay down to
++// 1, the halted sound's modulator short of wrapping
++static int idleCycles(struct NES* nes) {
++	struct Fds* f = FD;
++	const struct FdsSound* s = &f->sound;
++	if (!soundStill(s)) {
++		return 0;
++	}
++	int k = FDS_FOREVER;
++	if (!s->modHalt && s->modPitch) {
++		k = (int) ((0xFFFF - s->modPhase) / s->modPitch);
++	}
++	if (f->timerEnabled && f->diskEnabled && f->timerCounter < k) {
++		k = f->timerCounter;
++	}
++	switch (driveStep(nes)) {
++	case DRIVE_STOPPED:
++	case DRIVE_WAITING:
++		break;
++	case DRIVE_STOPPING:
++	case DRIVE_HEAD_BACK:
++		return 0;
++	case DRIVE_COUNTING:
++		if (f->delay - 1 < k) {
++			k = f->delay - 1;
++		}
++		break;
++	}
++	return k > 0 ? k : 0;
++}
++
++static void fdsRun(struct NES* nes, int cycles) {
++	struct Fds* f = FD;
++	while (cycles > 0) {
++		int k = idleCycles(nes);
++		if (k <= 0) {
++			fdsCycle(nes);
++			cycles--;
++			continue;
++		}
++		k = k < cycles ? k : cycles;
++		if (f->timerEnabled && f->diskEnabled) {
++			f->timerCounter -= k;
++		}
++		if (driveStep(nes) == DRIVE_COUNTING) {
++			f->delay -= k;
++		}
++		if (!f->sound.modHalt && f->sound.modPitch) {
++			f->sound.modPhase += (uint32_t) k * f->sound.modPitch;
++		}
++		cycles -= k;
++	}
++}
++
++// Cycles before the timer or the drive can raise the IRQ
++static int fdsIrqQuiet(struct NES* nes) {
++	struct Fds* f = FD;
++	int k = FDS_FOREVER;
++	if (f->timerEnabled && f->diskEnabled) {
++		k = f->timerCounter;
++	}
++	int drive = FDS_FOREVER;
++	switch (driveStep(nes)) {
++	case DRIVE_STOPPED:
++	case DRIVE_STOPPING:
++	case DRIVE_WAITING:
++		break;
++	case DRIVE_HEAD_BACK:
++		// The delay is set on the next cycle and runs out SPIN_UP cycles after it
++		drive = SPIN_UP;
++		break;
++	case DRIVE_COUNTING:
++		drive = f->delay > 1 ? f->delay - 1 : 0;
++		break;
++	}
++	return drive < k ? drive : k;
++}
++
++static int fdsAudioQuiet(struct NES* nes) {
++	return soundStill(&FD->sound) ? FDS_FOREVER : 0;
++}
++#endif
++
+ static int fdsAudio(struct NES* nes) {
+ 	return FD->sound.filtered;
+ }
+@@ -466,10 +632,20 @@
+ 	fdsSync(nes);
+ }
+ 
++#ifdef ARMNES_HOST_FDS_BATCH
++const struct Board boardFds = {
++	.name = "FDS", .reset = fdsReset, .write = fdsWrite, .read = fdsRead, .cpuRun = fdsRun,
++	.irqQuietCycles = fdsIrqQuiet, .audioQuietCycles = fdsAudioQuiet, .audio = fdsAudio,
++	// The RAM adapter's RAM ($6000-$DFFF) and BIOS: nothing but the disk header check at $E445
++	.plainPages = 0xFFC0, .watchAddress = 0xE445,
++	.sync = fdsSync, .stateSize = sizeof(struct Fds), .saveExtra = fdsSaveExtra, .loadExtra = fdsLoadExtra,
++};
++#else
+ const struct Board boardFds = {
+ 	.name = "FDS", .reset = fdsReset, .write = fdsWrite, .read = fdsRead, .cpuCycle = fdsCycle, .audio = fdsAudio,
+ 	.sync = fdsSync, .stateSize = sizeof(struct Fds), .saveExtra = fdsSaveExtra, .loadExtra = fdsLoadExtra,
+ };
++#endif
+ 
+ int fdsSide(struct NES* nes) {
+ 	return nes->board == &boardFds ? FD->side : -1;
+@@ -482,9 +658,18 @@
+ 
+ void fdsInsert(struct NES* nes, int side) {
+ 	if (nes->board == &boardFds && side < nes->cart.diskSides) {
++#ifdef ARMNES_HOST_FDS_BATCH
++		// Quiet cycles the CPU was granted before the change no longer hold
++		cpuSettle(nes);
++		nes->quietBudget = nes->quietGranted = 0;
++		fdsCatchUp(nes);
++#endif
+ 		FD->side = side;
+ 		FD->endOfHead = true;
+ 		FD->scanning = false;
++#ifdef ARMNES_HOST_FDS_BATCH
++		fdsRequiet(nes);
++#endif
+ 	}
+ }
+ 
