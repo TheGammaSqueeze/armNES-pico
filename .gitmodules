@@ -1,0 +1,6 @@
+[submodule "upstream"]
+	path = upstream
+	url = https://github.com/MagnominusGit/armNES
+[submodule "zlib"]
+	path = zlib
+	url = https://github.com/madler/zlib
