@@ -15,8 +15,8 @@
  *     load() runs, newlib's fopen of that one file is served from the buffer (pico_libc.c).
  *   - Options: set_option fills a table that GET_VARIABLE answers from, and GET_VARIABLE_UPDATE
  *     reports a change once, so libretro.c applies it at the end of the next frame. The port lists
- *     its options and values with SET_VARIABLES (we do not offer version 2 definitions); set_option
- *     takes only keys and values found there.
+ *     its options as version 2 definitions (names, value names, defaults), kept here for the LK's
+ *     Core Settings page (opt_count / opt_info); set_option takes only keys and values found there.
  *   - Frames the LK will not show: GET_AUDIO_VIDEO_ENABLE without the video bit makes libretro.c run
  *     the frame with armNES's own pixel skip (the fast PPU leaves out only what the picture needs;
  *     a sprite 0 hit the game polls for is still drawn), and with GET_CAN_DUPE it hands back no
@@ -66,8 +66,10 @@ long pico_host_seconds(void) { return g_imp && g_imp->host_time ? g_imp->host_ti
 static struct { char key[40]; char value[40]; } g_opt[OPT_MAX];
 static unsigned g_opt_count;
 static bool g_opt_changed;
-/* the port's own list, "Label; default|other|...", from SET_VARIABLES (static in the port) */
+/* the port's own list: version 2 definitions (static in the port), or "Label; default|other|..."
+ * from SET_VARIABLES when a frontend has no version 2 */
 static const struct retro_variable *g_vars;
+static const struct retro_core_options_v2 *g_defs;
 
 static void copy_str(char *d, const char *s, size_t cap)
 {
@@ -80,6 +82,17 @@ static void copy_str(char *d, const char *s, size_t cap)
 static bool option_valid(const char *key, const char *value)
 {
 	const struct retro_variable *v;
+	if (g_defs && g_defs->definitions) {
+		const struct retro_core_option_v2_definition *d;
+		for (d = g_defs->definitions; d->key; d++) {
+			unsigned k;
+			if (strcmp(d->key, key)) continue;
+			for (k = 0; k < RETRO_NUM_CORE_OPTION_VALUES_MAX && d->values[k].value; k++)
+				if (!strcmp(d->values[k].value, value)) return true;
+			return false;
+		}
+		return false;
+	}
 	if (!g_vars) return true;
 	for (v = g_vars; v->key; v++) {
 		const char *p;
@@ -98,6 +111,63 @@ static bool option_valid(const char *key, const char *value)
 	}
 	return false;
 }
+
+/* ---- the core's own options, for the LK's Core Settings page ----
+ * The definitions as struct pico_core_option (pointers into the port's constant tables), less the
+ * options the LK sets itself and the ones these consoles cannot use. */
+#define COPT_MAX   96
+#define COPT_VALS  2048
+static struct pico_core_option g_copt[COPT_MAX];
+static const char *g_copt_val[COPT_VALS], *g_copt_lab[COPT_VALS];
+static int g_copt_n, g_copt_vn;
+
+static bool starts(const char *s, const char *p) { return !strncmp(s, p, strlen(p)); }
+static bool copt_hidden(const char *key)
+{
+	return !strcmp(key, "armnes_region") || !strcmp(key, "armnes_aspect") ||	/* the LK's own rows */
+	       starts(key, "armnes_cart_code_") || !strcmp(key, "armnes_game_genie") ||	/* cheats: typed codes */
+	       !strcmp(key, "armnes_par_game") ||
+	       !strcmp(key, "armnes_left_stick_dpad") || !strcmp(key, "armnes_stick_invert") ||	/* the LK maps the pad */
+	       starts(key, "armnes_motion_") || !strcmp(key, "armnes_four_players") ||
+	       starts(key, "armnes_zapper_") ||					/* no light gun */
+	       !strcmp(key, "armnes_expansion");					/* no such devices */
+}
+
+static void copt_take(const struct retro_core_options_v2 *o)
+{
+	const struct retro_core_option_v2_definition *d;
+	g_defs = o;
+	g_copt_n = g_copt_vn = 0;
+	if (!o || !o->definitions) return;
+	for (d = o->definitions; d->key && g_copt_n < COPT_MAX; d++) {
+		struct pico_core_option *e = &g_copt[g_copt_n];
+		int nv = 0, k;
+		if (copt_hidden(d->key)) continue;
+		while (nv < RETRO_NUM_CORE_OPTION_VALUES_MAX && d->values[nv].value) nv++;
+		if (!nv || g_copt_vn + nv > COPT_VALS) continue;
+		e->key = d->key;
+		e->label = d->desc ? d->desc : d->key;
+		e->category = 0;
+		if (d->category_key && o->categories) {
+			const struct retro_core_option_v2_category *c;
+			for (c = o->categories; c->key; c++)
+				if (!strcmp(c->key, d->category_key)) { e->category = c->desc; break; }
+		}
+		e->values = &g_copt_val[g_copt_vn];
+		e->labels = &g_copt_lab[g_copt_vn];
+		e->nvalues = nv;
+		e->def = 0;
+		for (k = 0; k < nv; k++) {
+			g_copt_val[g_copt_vn + k] = d->values[k].value;
+			g_copt_lab[g_copt_vn + k] = d->values[k].label ? d->values[k].label : d->values[k].value;
+			if (d->default_value && !strcmp(d->values[k].value, d->default_value)) e->def = k;
+		}
+		g_copt_vn += nv;
+		g_copt_n++;
+	}
+}
+static int nes_opt_count(void) { return g_copt_n; }
+static const struct pico_core_option *nes_opt_info(int i) { return i >= 0 && i < g_copt_n ? &g_copt[i] : NULL; }
 
 static int nes_set_option(const char *key, const char *value)
 {
@@ -134,6 +204,12 @@ static unsigned g_frames_run;
 
 /* ---- libretro callbacks ---- */
 
+/* the memory map the port announces (RETRO_ENVIRONMENT_SET_MEMORY_MAPS), copied: its array need
+ * not outlive the call. For RetroAchievements (get_memory). */
+#define MEM_DESCS 16
+static struct retro_memory_descriptor g_mem_desc[MEM_DESCS];
+static unsigned g_mem_ndesc;
+
 static bool env_cb(unsigned cmd, void *data)
 {
 	switch (cmd) {
@@ -145,6 +221,15 @@ static bool env_cb(unsigned cmd, void *data)
 		return true;
 	case RETRO_ENVIRONMENT_SET_VARIABLES:
 		g_vars = (const struct retro_variable *) data;
+		return true;
+	case RETRO_ENVIRONMENT_GET_CORE_OPTIONS_VERSION:
+		if (!data) return false;
+		*(unsigned *) data = 2;		/* the definitions, with their value names and defaults */
+		return true;
+	case RETRO_ENVIRONMENT_SET_CORE_OPTIONS_V2:
+		copt_take((const struct retro_core_options_v2 *) data);
+		return true;
+	case RETRO_ENVIRONMENT_SET_CORE_OPTIONS_DISPLAY:
 		return true;
 	case RETRO_ENVIRONMENT_GET_VARIABLE: {
 		struct retro_variable *v = (struct retro_variable *) data;
@@ -175,8 +260,15 @@ static bool env_cb(unsigned cmd, void *data)
 	case RETRO_ENVIRONMENT_SET_INPUT_DESCRIPTORS:
 	case RETRO_ENVIRONMENT_SET_CONTROLLER_INFO:
 	case RETRO_ENVIRONMENT_SET_DISK_CONTROL_INTERFACE:
-	case RETRO_ENVIRONMENT_SET_MEMORY_MAPS:
 		return true;    /* noted; the LK reads geometry and timing back through av_info */
+	case RETRO_ENVIRONMENT_SET_MEMORY_MAPS: {
+		const struct retro_memory_map *m = (const struct retro_memory_map *) data;
+		g_mem_ndesc = 0;
+		if (m && m->descriptors)
+			for (; g_mem_ndesc < m->num_descriptors && g_mem_ndesc < MEM_DESCS; g_mem_ndesc++)
+				g_mem_desc[g_mem_ndesc] = m->descriptors[g_mem_ndesc];
+		return true;
+	}
 	default:
 		return false;   /* everything else declined: no option definitions, sensors, fast forward */
 	}
@@ -347,9 +439,23 @@ static unsigned nes_dbg_get(unsigned idx)
 	}
 }
 
+/* 3: the game's memory for RetroAchievements: the port's blocks and the map it announced, its
+ * descriptors laid out as pico_memdesc (pico_core_memory.h) */
+_Static_assert(sizeof(struct pico_memdesc) == sizeof(struct retro_memory_descriptor), "pico_memdesc layout");
+static void nes_get_memory(struct pico_core_memory *out)
+{
+	memset(out, 0, sizeof *out);
+	out->system_ram = retro_get_memory_data(RETRO_MEMORY_SYSTEM_RAM);
+	out->system_ram_size = out->system_ram ? (unsigned) retro_get_memory_size(RETRO_MEMORY_SYSTEM_RAM) : 0;
+	out->save_ram = retro_get_memory_data(RETRO_MEMORY_SAVE_RAM);
+	out->save_ram_size = out->save_ram ? (unsigned) retro_get_memory_size(RETRO_MEMORY_SAVE_RAM) : 0;
+	out->descriptors = g_mem_ndesc ? (const struct pico_memdesc *) g_mem_desc : NULL;
+	out->num_descriptors = g_mem_ndesc;
+}
+
 static const struct nes_core_exports g_exports = {
 	NES_CORE_ABI_MAGIC,
-	NES_CORE_ABI_VERSION,
+	NES_CORE_ABI_V3,
 	nes_heap_init,
 	nes_init,
 	nes_load,
@@ -370,6 +476,9 @@ static const struct nes_core_exports g_exports = {
 	pico_heap_reset,
 	nes_dbg_pc,
 	nes_dbg_get,
+	nes_opt_count,
+	nes_opt_info,
+	nes_get_memory,
 };
 
 __attribute__((used, section(".text.nes_core_blob_init")))

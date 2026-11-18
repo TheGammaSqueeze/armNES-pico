@@ -10,7 +10,7 @@
  *
  * Header (image offset 0):
  *   u32 magic      0x3153454E "NES1"
- *   u32 version    1 (NES_CORE_ABI_VERSION: change both together, the link script cannot include
+ *   u32 version    3 (NES_CORE_ABI_V3: change both together, the link script cannot include
  *                     the header)
  *   u32 entry      offset of nes_core_blob_init
  *   u32 load_size  bytes present in the file
@@ -26,7 +26,7 @@ SECTIONS
 	. = BLOB_VMA;
 	.header : {
 		LONG(0x3153454E);
-		LONG(1);
+		LONG(3);
 		LONG(nes_core_blob_init - BLOB_VMA);
 		LONG(__blob_load_end - BLOB_VMA);
 		LONG(__blob_end - BLOB_VMA);

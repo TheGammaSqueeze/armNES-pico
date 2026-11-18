@@ -266,6 +266,15 @@ int _fstat(int fd, struct stat *st)
 	return 0;
 }
 
+/* stat on a path (armNES 1.2's port looks for folders and file times beside a game): nothing is
+ * there but what _open serves, and that is not looked up by stat */
+int _stat(const char *path, struct stat *st)
+{
+	(void)path; (void)st;
+	errno = ENOENT;
+	return -1;
+}
+
 int _isatty(int fd) { return fd != MEMFILE_FD; }
 
 /* ---- the other system calls -------------------------------------------------------------------- */

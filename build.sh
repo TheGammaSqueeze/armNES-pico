@@ -60,10 +60,11 @@ TUNE=${TUNE:-cortex-a55}
 ARCH="-march=armv8-a+simd -mtune=$TUNE -marm -mfpu=neon-fp-armv8 -mfloat-abi=softfp"
 # The defines that turn the patches on (README.md, "Patches"); every file is built with them, as
 # some change structures the glue shares
-DEFS="-DARMNES_HOST_FDS_BATCH"
+DEFS=""
 BASE="$ARCH -std=gnu11 ${OPT:--O3} -flto -ffunction-sections -fdata-sections -fno-common $DEFS ${EXTRA_CFLAGS:-}"
 # shared/libretro comes before libretro-common's include folder, so "libretro.h" is armNES's copy
-INC="-I$SRC/shared/libretro -I$SRC/src -I$SRC/src/boards -I$ROOT/zlib"
+# pico/include first: the headers newlib lacks for this target (dirent.h)
+INC="-I$ROOT/pico/include -I$SRC/shared/libretro -I$SRC/src -I$SRC/src/boards -I$ROOT/zlib"
 # armNES's core, as its CMakeLists.txt builds it (-O3, functions aligned to 64 bytes)
 CORE_FLAGS="$BASE -falign-functions=64 -Wall -Wno-unused-parameter $INC -I$SRC/src/fceu -I$SRC/src/fceu/boards"
 # FCEUmm's boards are built with warnings off upstream too
@@ -79,7 +80,7 @@ RT_FLAGS="${BASE/-flto/} -fno-builtin -Wall -Wextra -I$ROOT/pico"
 CORE="src/apu.c src/arcade.c src/boards/asic.c src/boards/bandai.c src/boards/basic.c
 	src/boards/discrete.c src/boards/fds.c src/boards/jy.c src/boards/list.c src/boards/mmc3.c
 	src/boards/mmc5.c src/boards/multicart.c src/boards/nsf.c src/boards/rare.c src/boards/sachen.c
-	src/bus.c src/cart.c src/cheat.c src/cpu.c src/input.c src/nes.c src/ppu-fast.c src/ppu.c
+	src/bus.c src/cart.c src/cheat.c src/cpu.c src/genie.c src/input.c src/nes.c src/par.c src/ppu-fast.c src/ppu.c
 	src/sound/emu2413.c src/state.c src/fceu/bridge.c"
 FCEU=$(cd "$SRC" && ls src/fceu/boards/*.c | sort)
 PORT="libretro/libretro.c libretro/composite.c shared/libretro/options.c"
@@ -116,7 +117,7 @@ python3 - "$OUT/armnes-pico.blob" "$VERSION" <<'EOF'
 import struct, sys, hashlib
 d = open(sys.argv[1], 'rb').read()
 magic, ver, entry, load, span = struct.unpack_from('<5I', d)
-assert magic == 0x3153454E and ver == 1, "bad header"
+assert magic == 0x3153454E and ver == 3, "bad header"
 assert load == len(d), "load size %d != file %d" % (load, len(d))
 assert entry < load, "entry outside the image"
 slot = 0x50000000 - 0x4F800000

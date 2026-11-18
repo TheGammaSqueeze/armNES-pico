@@ -256,7 +256,8 @@ int main(int argc, char **argv)
 		}
 		printf("state round trip: frame 60 picture %08x / %08x, sound %08x / %08x\n", a[59].picture, b[59].picture, a[59].sound, b[59].sound);
 		check(same, "state round trip: 60 frames of picture and sound identical");
-		check(g->state_load(st, n - 1) != 0, "a short state is refused");
+		/* armNES 1.2 takes a state a little short (1.1's were), so only a cut one is refused */
+		check(g->state_load(st, n / 2) != 0, "a state cut in half is refused");
 		free(st);
 	}
 
