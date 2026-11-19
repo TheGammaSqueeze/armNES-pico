@@ -173,8 +173,8 @@ int main(int argc, char **argv)
 	{
 		unsigned char *b = slurp(argv[1], &bsz);
 		unsigned *hdr = (unsigned *) b;
-		if (hdr[0] != NES_CORE_ABI_MAGIC || hdr[1] != NES_CORE_ABI_VERSION || hdr[3] > bsz || hdr[4] > SLOT_SIZE || hdr[2] >= hdr[3]) {
-			fprintf(stderr, "bad blob header\n"); return 1;
+		if (hdr[0] != NES_CORE_ABI_MAGIC || hdr[1] < NES_CORE_ABI_VERSION || hdr[1] > NES_CORE_ABI_V3 || hdr[3] > bsz || hdr[4] > SLOT_SIZE || hdr[2] >= hdr[3]) {
+			fprintf(stderr, "bad blob header\n"); return 1;	/* (ABI 2 and 3 accepted, as the LK does) */
 		}
 		memcpy(slot, b, hdr[3]);
 		memset(slot + hdr[3], 0, hdr[4] - hdr[3]);
@@ -182,7 +182,7 @@ int main(int argc, char **argv)
 		g = ((nes_core_blob_init_fn) (void *) (slot + hdr[2]))(&s_imports);
 		printf("blob: %zu bytes, span %u (%.2f MiB of 8)\n", bsz, hdr[4], hdr[4] / 1048576.0);
 	}
-	if (!g || g->magic != NES_CORE_ABI_MAGIC || g->version != NES_CORE_ABI_VERSION) { fprintf(stderr, "init rejected\n"); return 1; }
+	if (!g || g->magic != NES_CORE_ABI_MAGIC || g->version < NES_CORE_ABI_VERSION || g->version > NES_CORE_ABI_V3) { fprintf(stderr, "init rejected\n"); return 1; }
 
 	g->heap_init((void *) ARENA_VMA, arena_mb << 20);
 	g->init();
