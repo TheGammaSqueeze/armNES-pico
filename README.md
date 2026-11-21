@@ -47,7 +47,7 @@ with both submodules at the commits the blob was built from.
 
 | Path | What it is |
 | --- | --- |
-| `upstream/` | armNES, as a git submodule at v1.2.1 (`4e6264a`), never modified in place |
+| `upstream/` | armNES, as a git submodule at v1.4 (`219911e`), never modified in place |
 | `patches/` | changes to upstream, applied by `build.sh` to a copy in `out/src` |
 | `zlib/` | zlib, as a git submodule at v1.3.1; only `crc32.c` is built |
 | `pico/pico_core.c` | the LK's core interface (`nes_core_abi.h`, version 1) filled in for armNES's libretro port |

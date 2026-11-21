@@ -44,6 +44,8 @@ bool     retro_load_game(const struct retro_game_info *);
 void     retro_unload_game(void);
 void     retro_run(void);
 void     retro_reset(void);
+void     retro_cheat_reset(void);
+void     retro_cheat_set(unsigned, bool, const char *);
 void     retro_get_system_av_info(struct retro_system_av_info *);
 void    *retro_get_memory_data(unsigned);
 size_t   retro_get_memory_size(unsigned);
@@ -57,6 +59,7 @@ bool     retro_unserialize(const void *, size_t);
 #define PICO_BIOS_BYTES 0x2000u
 
 static const struct nes_core_imports *g_imp;
+static unsigned g_messages;   /* the port's SET_MESSAGE calls (nes_cheat_add) */
 
 long pico_host_seconds(void) { return g_imp && g_imp->host_time ? g_imp->host_time() : 0; }
 
@@ -254,9 +257,11 @@ static bool env_cb(unsigned cmd, void *data)
 		if (!data) return false;
 		*(bool *) data = true;
 		return true;
+	case RETRO_ENVIRONMENT_SET_MESSAGE:
+		g_messages++;   /* counted: a cheat code the port could not read says so this way */
+		return true;
 	case RETRO_ENVIRONMENT_SET_GEOMETRY:
 	case RETRO_ENVIRONMENT_SET_SYSTEM_AV_INFO:
-	case RETRO_ENVIRONMENT_SET_MESSAGE:
 	case RETRO_ENVIRONMENT_SET_INPUT_DESCRIPTORS:
 	case RETRO_ENVIRONMENT_SET_CONTROLLER_INFO:
 	case RETRO_ENVIRONMENT_SET_DISK_CONTROL_INTERFACE:
@@ -453,9 +458,21 @@ static void nes_get_memory(struct pico_core_memory *out)
 	out->num_descriptors = g_mem_ndesc;
 }
 
+/* 4: cheat codes, through the port's retro_cheat_* (armNES's Game Genie and raw address codes).
+ * The port tells a code it could not read with a message, which is how cheat_add knows. */
+static unsigned g_cheat_next;
+static void nes_cheat_reset(void) { retro_cheat_reset(); g_cheat_next = 0; }
+static int nes_cheat_add(const char *code)
+{
+	unsigned before = g_messages;
+	if (!code) return -1;
+	retro_cheat_set(g_cheat_next++, true, code);
+	return g_messages == before ? 0 : -1;
+}
+
 static const struct nes_core_exports g_exports = {
 	NES_CORE_ABI_MAGIC,
-	NES_CORE_ABI_V3,
+	NES_CORE_ABI_V4,
 	nes_heap_init,
 	nes_init,
 	nes_load,
@@ -479,6 +496,8 @@ static const struct nes_core_exports g_exports = {
 	nes_opt_count,
 	nes_opt_info,
 	nes_get_memory,
+	nes_cheat_reset,
+	nes_cheat_add,
 };
 
 __attribute__((used, section(".text.nes_core_blob_init")))
